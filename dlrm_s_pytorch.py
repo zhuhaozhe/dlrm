@@ -75,7 +75,10 @@ from numpy import random as ra
 from torch.nn.parallel.parallel_apply import parallel_apply
 from torch.nn.parallel.replicate import replicate
 from torch.nn.parallel.scatter_gather import gather, scatter
-
+from torch.quantization import \
+    quantize, prepare, convert, fuse_modules
+from torch.quantization import QuantWrapper, QuantStub, DeQuantStub, \
+    default_per_channel_qconfig, QConfig, default_qconfig
 
 # from torchviz import make_dot
 # import torch.nn.functional as Functional
@@ -89,6 +92,7 @@ class DLRM_Net(nn.Module):
     def create_mlp(self, ln, sigmoid_layer):
         # build MLP layer by layer
         layers = nn.ModuleList()
+        # layers.append(QuantStub())
         for i in range(0, ln.size - 1):
             n = ln[i]
             m = ln[i + 1]
@@ -120,11 +124,10 @@ class DLRM_Net(nn.Module):
                 layers.append(nn.Sigmoid())
             else:
                 layers.append(nn.ReLU())
-
         # approach 1: use ModuleList
-        # return layers
+        return layers
         # approach 2: use Sequential container to wrap all layers
-        return torch.nn.Sequential(*layers)
+        # return torch.nn.Sequential(*layers)
 
     def create_emb(self, m, ln):
         emb_l = nn.ModuleList()
@@ -188,11 +191,11 @@ class DLRM_Net(nn.Module):
 
     def apply_mlp(self, x, layers):
         # approach 1: use ModuleList
-        # for layer in layers:
-        #     x = layer(x)
-        # return x
+        for layer in layers:
+            x = layer(x)
+        return x
         # approach 2: use Sequential container to wrap all layers
-        return layers(x)
+        # return layers(x)
 
     def apply_emb(self, lS_o, lS_i, emb_l):
         # WARNING: notice that we are processing the batch at once. We implicitly
@@ -395,6 +398,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Train Deep Learning Recommendation Model (DLRM)"
     )
+    # int8_inference
+    parser.add_argument("--do-int8-inference", action="store_true", default=False)
+    parser.add_argument("--per-tensor-linear", action="store_true", default=False)
     # model related parameters
     parser.add_argument("--arch-sparse-feature-size", type=int, default=2)
     parser.add_argument("--arch-embedding-size", type=str, default="4-3-2")
@@ -735,10 +741,40 @@ if __name__ == "__main__":
             )
         )
 
+    if args.do_int8_inference and args.inference_only:
+        print('do_int8_inference')
+        fuse_list = []
+        for i in range(0, len(dlrm.bot_l), 2):
+            fuse_list.append(["bot_l.%d" % (i), "bot_l.%d" % (i + 1)])
+        dlrm = fuse_modules(dlrm, fuse_list)
+        fuse_list = []
+        for i in range(0, len(dlrm.top_l) - 2, 2):
+            fuse_list.append(["top_l.%d" % (i), "top_l.%d" % (i + 1)])
+        dlrm = fuse_modules(dlrm, fuse_list)
+        dlrm.bot_l.insert(0, QuantStub())
+        dlrm.bot_l.append(DeQuantStub())
+        dlrm.top_l.insert(0, QuantStub())
+        dlrm.top_l.insert(len(dlrm.top_l) - 1, DeQuantStub())
+        dlrm.qconfig = default_per_channel_qconfig
+        if args.per_tensor_linear:
+            dlrm.bot_l.qconfig = default_qconfig
+            dlrm.top_l.qconfig = default_qconfig
+        dlrm = prepare(dlrm)
+        j = 0
+        while j < 0.05 * nbatches:
+            Z = dlrm_wrap(lX[j], lS_o[j], lS_i[j], use_gpu, device)
+            j += 1
+        print("convert")
+        dlrm = convert(dlrm)
+        print("convert done")
+
+
     print("time/loss/accuracy (if enabled):")
     with torch.autograd.profiler.profile(args.enable_profiling, use_gpu) as prof:
         while k < args.nepochs:
             j = 0
+            if args.do_int8_inference and args.inference_only:
+                j = round(0.05 * nbatches)
             while j < nbatches:
                 t1 = time_wrap(use_gpu)
 
@@ -878,7 +914,7 @@ if __name__ == "__main__":
         with open("dlrm_s_pytorch.prof", "w") as prof_f:
             prof_f.write(prof.key_averages().table(sort_by="cpu_time_total"))
             prof.export_chrome_trace("./dlrm_s_pytorch.json")
-        # print(prof.key_averages().table(sort_by="cpu_time_total"))
+        print(prof.key_averages().table(sort_by="self_cpu_time_total"))
 
     # plot compute graph
     if args.plot_compute_graph:
