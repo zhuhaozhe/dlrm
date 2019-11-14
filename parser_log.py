@@ -21,7 +21,7 @@ if __name__ == "__main__":
     else:
         for i in range(2):
             core_sum = 0
-            fp = open(r'./log/int8_throughput0.log')
+            fp = open(r'./log/int8_throughput%d.log' % i)
             content = fp.readlines()
             for line in content[-10: -1]:
                 core_sum += float(line.split(" ")[7])
