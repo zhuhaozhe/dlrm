@@ -16,7 +16,7 @@ echo "--------------------------------------------"
 export KMP_BLOCKTIME=1
 export KMP_AFFINITY=granularity=fine,compact,1,0
 numactl --physcpubind=0-27 --membind=0 python dlrm_s_pytorch.py --mini-batch-size=16 --num-batches=1000 --data-generation=random --arch-mlp-bot=512-512-64 --arch-mlp-top=1024-1024-1024-1 --arch-sparse-feature-size=64 --arch-embedding-size=1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000 --num-indices-per-lookup=100 --arch-interaction-op=dot --numpy-rand-seed=727 --print-freq=100 --print-time --inference-only --do-int8-inference > log/int8_throughput0.log &
-numactl --physcpubind=28-55 --membind=0 python dlrm_s_pytorch.py --mini-batch-size=16 --num-batches=1000 --data-generation=random --arch-mlp-bot=512-512-64 --arch-mlp-top=1024-1024-1024-1 --arch-sparse-feature-size=64 --arch-embedding-size=1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000 --num-indices-per-lookup=100 --arch-interaction-op=dot --numpy-rand-seed=727 --print-freq=100 --print-time --inference-only --do-int8-inference > log/int8_throughput1.log 
+numactl --physcpubind=28-55 --membind=1 python dlrm_s_pytorch.py --mini-batch-size=16 --num-batches=1000 --data-generation=random --arch-mlp-bot=512-512-64 --arch-mlp-top=1024-1024-1024-1 --arch-sparse-feature-size=64 --arch-embedding-size=1000000-1000000-1000000-1000000-1000000-1000000-1000000-1000000 --num-indices-per-lookup=100 --arch-interaction-op=dot --numpy-rand-seed=727 --print-freq=100 --print-time --inference-only --do-int8-inference > log/int8_throughput1.log 
 wait
 python parser_log.py
 echo "--------------------------------------------"
