@@ -7,29 +7,27 @@ if __name__ == "__main__":
     args = parser.parse_args()
     sum = 0
     if args.real_time:
-        for i in range(14):
+        for i in range(28):
             core_sum = 0
             fp = open(r'./log/model1_CPU_PT_instance%d.log' % i)
             content = fp.readlines()
             for line in content[-10: -1]:
                 core_sum += float(line.split(" ")[7])
             core_sum /= 9
-            print("instance%d on core %d-%d: average %f ms/it" % (i, i * 4, i * 4 + 3, core_sum))
+            print("instance%d on core %d: average %f ms/it" % (i, i, core_sum))
             sum += core_sum
         print("-----------------result---------------------")
-        print("realtime: average %f ms/it" % (sum / 14))
+        print("realtime: average %f ms/it" % (sum / 28))
     else:
-        for i in range(2):
+        for i in range(28):
             core_sum = 0
-            fp = open(r'./log/int8_throughput%d.log' % i)
+            fp = open(r'./log/model1_CPU_PT_instance%d.log' % i)
             content = fp.readlines()
             for line in content[-10: -1]:
                 core_sum += float(line.split(" ")[7])
             core_sum /= 9
             samples_per_second = 1 / core_sum * 1000 * 16
-            print("instance%d on core %d-%d: average %f samples/s" % (i, i * 28, i * 28 + 27, samples_per_second))
+            print("instance%d on core %d: average %f samples/s" % (i, i, samples_per_second))
             sum += samples_per_second
         print("-----------------result---------------------")
-        print("throughput: average %f samples/s" % (sum / 2))
-
-
+        print("throughput: %f samples/s" % (sum))
