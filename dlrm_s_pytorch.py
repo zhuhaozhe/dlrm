@@ -437,6 +437,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Train Deep Learning Recommendation Model (DLRM)"
     )
+    # share weight when running multi-instance inference
+    parser.add_argument("--share-weight", action="store_true", default=False)
     # model related parameters
     parser.add_argument("--arch-sparse-feature-size", type=int, default=2)
     parser.add_argument("--arch-embedding-size", type=str, default="4-3-2")
@@ -815,6 +817,23 @@ if __name__ == "__main__":
                 ld_gL_test, ld_gA_test * 100
             )
         )
+
+    if args.share_weight:
+        for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
+            traced_model = torch.jit.trace(dlrm, (X, lS_o, lS_i), check_trace=False)
+            # only need give an example input for torch.jit.trance
+            break
+        from torch.utils import ThroughputBenchmark
+        bench = ThroughputBenchmark(traced_model)
+        for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
+            bench.add_input(X, lS_o, lS_i)
+        stats = bench.benchmark(
+            num_calling_threads=28,
+            num_warmup_iters=10,
+            num_iters=900 * 28,
+        )
+        print(stats)
+        exit()
 
     print("time/loss/accuracy (if enabled):")
     with torch.autograd.profiler.profile(args.enable_profiling, use_gpu) as prof:
