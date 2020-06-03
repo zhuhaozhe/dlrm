@@ -1,0 +1,243 @@
+diff --git a/bench/run_and_time.sh b/bench/run_and_time.sh
+index e241d80..3bfb831 100755
+--- a/bench/run_and_time.sh
++++ b/bench/run_and_time.sh
+@@ -13,7 +13,16 @@ else
+     dlrm_extra_option=""
+ fi
+ #echo $dlrm_extra_option
++export data_path=<path/for/dataset>
++export fp32_load_path=<path/to/load/fp32_weight>
+ 
+-python dlrm_s_pytorch.py --arch-sparse-feature-size=128 --arch-mlp-bot="13-512-256-128" --arch-mlp-top="1024-1024-512-256-1" --max-ind-range=40000000 --data-generation=dataset --data-set=terabyte --raw-data-file=./input/day --processed-data-file=./input/terabyte_processed.npz --loss-function=bce --round-targets=True --learning-rate=1.0 --mini-batch-size=2048 --print-freq=2048 --print-time --test-freq=102400 --test-mini-batch-size=16384 --test-num-workers=16 --memory-map --mlperf-logging --mlperf-auc-threshold=0.8025 --mlperf-bin-loader --mlperf-bin-shuffle $dlrm_extra_option 2>&1 | tee run_terabyte_mlperf_pt.log
+-
++echo "fp32 inference"
++python -u dlrm_s_pytorch.py --arch-sparse-feature-size=128 --arch-mlp-bot="13-512-256-128" --arch-mlp-top="1024-1024-512-256-1" --max-ind-range=40000000 --data-generation=dataset --data-set=terabyte --raw-data-file=${data_path}/day --processed-data-file=${data_path}/terabyte_processed.npz --loss-function=bce --round-targets=True --learning-rate=1.0 --mini-batch-size=2048 --print-freq=2048 --print-time --test-freq=102400 --test-mini-batch-size=16384 --test-num-workers=16 --memory-map --mlperf-logging --mlperf-auc-threshold=0.8025 --mlperf-bin-loader --mlperf-bin-shuffle --load-model=${fp32_load_path}  --inference-only $dlrm_extra_option 2>&1 | tee run_terabyte_mlperf_pt_fp32inference.log
++echo "int8 inference"
++python -u dlrm_s_pytorch.py --arch-sparse-feature-size=128 --arch-mlp-bot="13-512-256-128" --arch-mlp-top="1024-1024-512-256-1" --max-ind-range=40000000 --data-generation=dataset --data-set=terabyte --raw-data-file=${data_path}/day --processed-data-file=${data_path}/terabyte_processed.npz --loss-function=bce --round-targets=True --learning-rate=1.0 --mini-batch-size=2048 --print-freq=2048 --print-time --test-freq=102400 --test-mini-batch-size=16384 --test-num-workers=16 --memory-map --mlperf-logging --mlperf-auc-threshold=0.8025 --mlperf-bin-loader --mlperf-bin-shuffle --load-model=${fp32_load_path}  --inference-only --do-int8-inference  $dlrm_extra_option 2>&1 | tee run_terabyte_mlperf_pt_int8.log
+ echo "done"
++
++
++
++
++
+diff --git a/dlrm_s_pytorch.py b/dlrm_s_pytorch.py
+index 9bf762b..71f8d3a 100644
+--- a/dlrm_s_pytorch.py
++++ b/dlrm_s_pytorch.py
+@@ -87,6 +87,12 @@ from tricks.md_embedding_bag import PrEmbeddingBag, md_solver
+ 
+ import sklearn.metrics
+ 
++from torch.quantization import \
++    quantize, prepare, convert, fuse_modules
++from torch.quantization import QuantWrapper, QuantStub, DeQuantStub, \
++    default_per_channel_qconfig, QConfig, default_qconfig
++
++
+ # from torchviz import make_dot
+ # import torch.nn.functional as Functional
+ # from torch.nn.parameter import Parameter
+@@ -132,9 +138,9 @@ class DLRM_Net(nn.Module):
+                 layers.append(nn.ReLU())
+ 
+         # approach 1: use ModuleList
+-        # return layers
++        return layers
+         # approach 2: use Sequential container to wrap all layers
+-        return torch.nn.Sequential(*layers)
++        # return torch.nn.Sequential(*layers)
+ 
+     def create_emb(self, m, ln):
+         emb_l = nn.ModuleList()
+@@ -230,11 +236,11 @@ class DLRM_Net(nn.Module):
+ 
+     def apply_mlp(self, x, layers):
+         # approach 1: use ModuleList
+-        # for layer in layers:
+-        #     x = layer(x)
+-        # return x
++        for layer in layers:
++            x = layer(x)
++        return x
+         # approach 2: use Sequential container to wrap all layers
+-        return layers(x)
++        # return layers(x)
+ 
+     def apply_emb(self, lS_o, lS_i, emb_l):
+         # WARNING: notice that we are processing the batch at once. We implicitly
+@@ -448,6 +454,9 @@ if __name__ == "__main__":
+     # model related parameters
+     parser.add_argument("--arch-sparse-feature-size", type=int, default=2)
+     parser.add_argument("--arch-embedding-size", type=str, default="4-3-2")
++    # int8_inference
++    parser.add_argument("--do-int8-inference", action="store_true", default=False)
++    parser.add_argument("--per-tensor-linear", action="store_true", default=False)
+     # j will be replaced with the table number
+     parser.add_argument("--arch-mlp-bot", type=str, default="4-3-2")
+     parser.add_argument("--arch-mlp-top", type=str, default="4-2-1")
+@@ -509,6 +518,7 @@ if __name__ == "__main__":
+     parser.add_argument("--enable-profiling", action="store_true", default=False)
+     parser.add_argument("--plot-compute-graph", action="store_true", default=False)
+     # store/load model
++    parser.add_argument("--save-int8", type=str, default="")
+     parser.add_argument("--save-model", type=str, default="")
+     parser.add_argument("--load-model", type=str, default="")
+     # mlperf logging (disables other output and stops early)
+@@ -555,7 +565,7 @@ if __name__ == "__main__":
+ 
+         train_data, train_ld, test_data, test_ld = \
+             dp.make_criteo_data_and_loaders(args)
+-        nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
++        nbatches = args.num_batches if args.num_batches > 0 else len(test_ld)
+         nbatches_test = len(test_ld)
+ 
+         ln_emb = train_data.counts
+@@ -864,6 +874,57 @@ if __name__ == "__main__":
+                 ld_gL_test, ld_gA_test * 100
+             )
+         )
++    
++
++
++    if args.do_int8_inference and args.inference_only:
++        print('do_int8_inference')
++        fuse_list = []
++        for i in range(0, len(dlrm.bot_l), 2):
++            fuse_list.append(["bot_l.%d" % (i), "bot_l.%d" % (i + 1)])
++        dlrm = fuse_modules(dlrm, fuse_list)
++        fuse_list = []
++        for i in range(0, len(dlrm.top_l) - 2, 2):
++            fuse_list.append(["top_l.%d" % (i), "top_l.%d" % (i + 1)])
++        dlrm = fuse_modules(dlrm, fuse_list)
++        dlrm.bot_l.insert(0, QuantStub())
++        dlrm.bot_l.append(DeQuantStub())
++        dlrm.top_l.insert(0, QuantStub())
++        dlrm.top_l.insert(len(dlrm.top_l) - 1, DeQuantStub())
++        dlrm.qconfig = default_per_channel_qconfig
++        if args.per_tensor_linear:
++            dlrm.bot_l.qconfig = default_qconfig
++            dlrm.top_l.qconfig = default_qconfig
++        dlrm = prepare(dlrm)
++        j = 0
++        for j, (X, lS_o, lS_i, T) in enumerate(test_ld):
++            Z = dlrm_wrap(X, lS_o, lS_i, use_gpu, device)
++            if j > nbatches * 0.05:
++                break
++        print("convert")
++        dlrm = convert(dlrm)
++        print("convert done")
++        if not (args.save_int8 == ""):
++             print("Saving model to {}".format(args.save_int8))
++             torch.save(
++                      {
++                          "epoch": ld_k,
++                          "nepochs": ld_nepochs,
++                          "nbatches": ld_nbatches,
++                          "nbatches_test": ld_nbatches_test,
++                          "iter": ld_j,
++                          "state_dict": dlrm.state_dict(),
++                          "train_acc": ld_gA,
++                          "train_loss": ld_gL,
++                          "test_acc": ld_gA_test,
++                          "test_loss": ld_gL_test,
++                          "total_loss": ld_total_loss,
++                          "total_accu": ld_total_accu,
++                      },
++                      args.save_int8,
++                  )
++
++
+ 
+     print("time/loss/accuracy (if enabled):")
+     with torch.autograd.profiler.profile(args.enable_profiling, use_gpu) as prof:
+@@ -875,8 +936,10 @@ if __name__ == "__main__":
+ 
+             if args.mlperf_logging:
+                 previous_iteration_time = None
+-
+-            for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
++            if args.mlperf_logging:
++                scores = []
++                targets = []
++            for j, (X, lS_o, lS_i, T) in enumerate(test_ld):
+                 if j < skip_upto_batch:
+                     continue
+ 
+@@ -918,6 +981,9 @@ if __name__ == "__main__":
+                 L = E.detach().cpu().numpy()  # numpy array
+                 S = Z.detach().cpu().numpy()  # numpy array
+                 T = T.detach().cpu().numpy()  # numpy array
++                if args.mlperf_logging:
++                    scores.append(S)
++                    targets.append(T)
+                 mbs = T.shape[0]  # = args.mini_batch_size except maybe for last
+                 A = np.sum((np.round(S, 0) == T).astype(np.uint8))
+ 
+@@ -954,6 +1020,36 @@ if __name__ == "__main__":
+ 
+                 # print time, loss and accuracy
+                 if should_print or should_test:
++                    if args.mlperf_logging:
++                        scores = np.concatenate(scores, axis=0)
++                        targets = np.concatenate(targets, axis=0)
++                        metrics = {
++                            'loss' : sklearn.metrics.log_loss,
++                            'recall' : lambda y_true, y_score:
++                            sklearn.metrics.recall_score(
++                                y_true=y_true,
++                                y_pred=np.round(y_score)
++                            ),
++                            'precision' : lambda y_true, y_score:
++                            sklearn.metrics.precision_score(
++                                y_true=y_true,
++                                y_pred=np.round(y_score)
++                            ),
++                            'f1' : lambda y_true, y_score:
++                            sklearn.metrics.f1_score(
++                                y_true=y_true,
++                                y_pred=np.round(y_score)
++                            ),
++                            'ap' : sklearn.metrics.average_precision_score,
++                            'roc_auc' : sklearn.metrics.roc_auc_score,
++                        }
++
++                        validation_results = {}
++                        for metric_name, metric_function in metrics.items():
++                            validation_results[metric_name] = metric_function(
++                                targets,
++                                scores
++                            )
+                     gT = 1000.0 * total_time / total_iter if args.print_time else -1
+                     total_time = 0
+ 
+@@ -970,6 +1066,20 @@ if __name__ == "__main__":
+                         )
+                         + "loss {:.6f}, accuracy {:3.3f} %".format(gL, gA * 100)
+                     )
++                    print(
++                            " loss {:.6f}, recall {:.4f}, precision {:.4f},".format(
++                                        validation_results['loss'],
++                                        validation_results['recall'],
++                                        validation_results['precision']
++                                    )
++                            + " f1 {:.4f}, ap {:.4f},".format(
++                                        validation_results['f1'],
++                                        validation_results['ap'],
++                                    )
++                            + " auc {:.4f},".format(
++                                        validation_results['roc_auc'],
++                                    )
++                        )
+                     # Uncomment the line below to print out the total time with overhead
+                     # print("Accumulated time so far: {}" \
+                     # .format(time_wrap(use_gpu) - accum_time_begin))
+@@ -1162,7 +1272,7 @@ if __name__ == "__main__":
+         with open("dlrm_s_pytorch.prof", "w") as prof_f:
+             prof_f.write(prof.key_averages().table(sort_by="cpu_time_total"))
+             prof.export_chrome_trace("./dlrm_s_pytorch.json")
+-        # print(prof.key_averages().table(sort_by="cpu_time_total"))
++        print(prof.key_averages().table(sort_by="cpu_time_total"))
+ 
+     # plot compute graph
+     if args.plot_compute_graph:

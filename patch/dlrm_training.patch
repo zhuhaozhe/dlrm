@@ -1,0 +1,138 @@
+diff --git a/bench/run_and_time.sh b/bench/run_and_time.sh
+index e241d80..c49a4e5 100755
+--- a/bench/run_and_time.sh
++++ b/bench/run_and_time.sh
+@@ -13,7 +13,8 @@ else
+     dlrm_extra_option=""
+ fi
+ #echo $dlrm_extra_option
+-
+-python dlrm_s_pytorch.py --arch-sparse-feature-size=128 --arch-mlp-bot="13-512-256-128" --arch-mlp-top="1024-1024-512-256-1" --max-ind-range=40000000 --data-generation=dataset --data-set=terabyte --raw-data-file=./input/day --processed-data-file=./input/terabyte_processed.npz --loss-function=bce --round-targets=True --learning-rate=1.0 --mini-batch-size=2048 --print-freq=2048 --print-time --test-freq=102400 --test-mini-batch-size=16384 --test-num-workers=16 --memory-map --mlperf-logging --mlperf-auc-threshold=0.8025 --mlperf-bin-loader --mlperf-bin-shuffle $dlrm_extra_option 2>&1 | tee run_terabyte_mlperf_pt.log
++export fp32_save_path=<path/to/save/fp32_weight>
++export data_path=<patch/for/dataset>
++python dlrm_s_pytorch.py --arch-sparse-feature-size=128 --arch-mlp-bot="13-512-256-128" --arch-mlp-top="1024-1024-512-256-1" --max-ind-range=40000000 --data-generation=dataset --data-set=terabyte --raw-data-file=$data_path/input/day --processed-data-file=$data_path/input/terabyte_processed.npz --loss-function=bce --round-targets=True --learning-rate=1.0 --mini-batch-size=2048 --print-freq=2048 --print-time --test-freq=102400 --test-mini-batch-size=16384 --test-num-workers=16 --memory-map --mlperf-logging --mlperf-auc-threshold=0.8025 --mlperf-bin-loader --mlperf-bin-shuffle $dlrm_extra_option --save-model=$fp32_save_path 2>&1 | tee run_terabyte_mlperf_pt.log
+ 
+ echo "done"
+diff --git a/dlrm_s_pytorch.py b/dlrm_s_pytorch.py
+index 9bf762b..7582d99 100644
+--- a/dlrm_s_pytorch.py
++++ b/dlrm_s_pytorch.py
+@@ -87,6 +87,12 @@ from tricks.md_embedding_bag import PrEmbeddingBag, md_solver
+ 
+ import sklearn.metrics
+ 
++from torch.quantization import \
++    quantize, prepare, convert, fuse_modules
++from torch.quantization import QuantWrapper, QuantStub, DeQuantStub, \
++    default_per_channel_qconfig, QConfig, default_qconfig
++
++
+ # from torchviz import make_dot
+ # import torch.nn.functional as Functional
+ # from torch.nn.parameter import Parameter
+@@ -132,9 +138,9 @@ class DLRM_Net(nn.Module):
+                 layers.append(nn.ReLU())
+ 
+         # approach 1: use ModuleList
+-        # return layers
++        return layers
+         # approach 2: use Sequential container to wrap all layers
+-        return torch.nn.Sequential(*layers)
++        # return torch.nn.Sequential(*layers)
+ 
+     def create_emb(self, m, ln):
+         emb_l = nn.ModuleList()
+@@ -230,11 +236,11 @@ class DLRM_Net(nn.Module):
+ 
+     def apply_mlp(self, x, layers):
+         # approach 1: use ModuleList
+-        # for layer in layers:
+-        #     x = layer(x)
+-        # return x
++        for layer in layers:
++            x = layer(x)
++        return x
+         # approach 2: use Sequential container to wrap all layers
+-        return layers(x)
++        # return layers(x)
+ 
+     def apply_emb(self, lS_o, lS_i, emb_l):
+         # WARNING: notice that we are processing the batch at once. We implicitly
+@@ -448,6 +454,9 @@ if __name__ == "__main__":
+     # model related parameters
+     parser.add_argument("--arch-sparse-feature-size", type=int, default=2)
+     parser.add_argument("--arch-embedding-size", type=str, default="4-3-2")
++    # int8_inference
++    parser.add_argument("--do-int8-inference", action="store_true", default=False)
++    parser.add_argument("--per-tensor-linear", action="store_true", default=False)
+     # j will be replaced with the table number
+     parser.add_argument("--arch-mlp-bot", type=str, default="4-3-2")
+     parser.add_argument("--arch-mlp-top", type=str, default="4-2-1")
+@@ -509,6 +518,7 @@ if __name__ == "__main__":
+     parser.add_argument("--enable-profiling", action="store_true", default=False)
+     parser.add_argument("--plot-compute-graph", action="store_true", default=False)
+     # store/load model
++    parser.add_argument("--save-int8", type=str, default="")
+     parser.add_argument("--save-model", type=str, default="")
+     parser.add_argument("--load-model", type=str, default="")
+     # mlperf logging (disables other output and stops early)
+@@ -864,6 +874,59 @@ if __name__ == "__main__":
+                 ld_gL_test, ld_gA_test * 100
+             )
+         )
++    
++
++
++    if args.do_int8_inference and args.inference_only:
++        print('do_int8_inference')
++        data = train_ld.sampler.data_source
++        fuse_list = []
++        for i in range(0, len(dlrm.bot_l), 2):
++            fuse_list.append(["bot_l.%d" % (i), "bot_l.%d" % (i + 1)])
++        dlrm = fuse_modules(dlrm, fuse_list)
++        fuse_list = []
++        for i in range(0, len(dlrm.top_l) - 2, 2):
++            fuse_list.append(["top_l.%d" % (i), "top_l.%d" % (i + 1)])
++        dlrm = fuse_modules(dlrm, fuse_list)
++        dlrm.bot_l.insert(0, QuantStub())
++        dlrm.bot_l.append(DeQuantStub())
++        dlrm.top_l.insert(0, QuantStub())
++        dlrm.top_l.insert(len(dlrm.top_l) - 1, DeQuantStub())
++        dlrm.qconfig = default_per_channel_qconfig
++        if args.per_tensor_linear:
++            dlrm.bot_l.qconfig = default_qconfig
++            dlrm.top_l.qconfig = default_qconfig
++        dlrm = prepare(dlrm)
++        j = 0
++        for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
++            Z = dlrm_wrap(X, lS_o, lS_i, use_gpu, device)
++            if j > nbatches * 0.05:
++                break
++        print("convert")
++        dlrm = convert(dlrm)
++        print("convert done")
++        if not (args.save_int8 == ""):
++             print("Saving model to {}".format(args.save_model))
++             torch.save(
++                      {
++                          "epoch": ld_k,
++                          "nepochs": ld_nepochs,
++                          "nbatches": ld_nbatches,
++                          "nbatches_test": ld_nbatches_test,
++                          "iter": ld_j,
++                          "state_dict": dlrm.state_dict(),
++                          "train_acc": ld_gA,
++                          "train_loss": ld_gL,
++                          "test_acc": ld_gA_test,
++                          "test_loss": ld_gL_test,
++                          "total_loss": ld_total_loss,
++                          "total_accu": ld_total_accu,
++                          "opt_state_dict": optimizer.state_dict(),
++                      },
++                      args.save_model,
++                  )
++
++
+ 
+     print("time/loss/accuracy (if enabled):")
+     with torch.autograd.profiler.profile(args.enable_profiling, use_gpu) as prof:
