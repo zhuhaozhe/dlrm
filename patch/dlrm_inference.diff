@@ -1,31 +1,87 @@
 diff --git a/bench/run_and_time.sh b/bench/run_and_time.sh
-index e241d80..3bfb831 100755
+index e241d80..965ad4a 100755
 --- a/bench/run_and_time.sh
 +++ b/bench/run_and_time.sh
-@@ -13,7 +13,16 @@ else
+@@ -12,8 +12,24 @@ if [[ $# == 1 ]]; then
+ else
      dlrm_extra_option=""
  fi
- #echo $dlrm_extra_option
-+export data_path=<path/for/dataset>
-+export fp32_load_path=<path/to/load/fp32_weight>
+-#echo $dlrm_extra_option
  
 -python dlrm_s_pytorch.py --arch-sparse-feature-size=128 --arch-mlp-bot="13-512-256-128" --arch-mlp-top="1024-1024-512-256-1" --max-ind-range=40000000 --data-generation=dataset --data-set=terabyte --raw-data-file=./input/day --processed-data-file=./input/terabyte_processed.npz --loss-function=bce --round-targets=True --learning-rate=1.0 --mini-batch-size=2048 --print-freq=2048 --print-time --test-freq=102400 --test-mini-batch-size=16384 --test-num-workers=16 --memory-map --mlperf-logging --mlperf-auc-threshold=0.8025 --mlperf-bin-loader --mlperf-bin-shuffle $dlrm_extra_option 2>&1 | tee run_terabyte_mlperf_pt.log
--
++########################################################################################
++#instead pathes to your local pathes here
++export int8_path=/home/haozhezh/mlperf_dlrm/dlrm/pre-trained/terabyte_mlperf_int81.pt
++export data_path=/mnt/local_disk/dataset/dlrm/dlrm/input
++export fp32_load_path=/home/haozhezh/mlperf_dlrm/dlrm/pre-trained/terabyte_mlperf.pt
++########################################################################################
++export LD_PRELOAD="$HOME/.local/lib/libtcmalloc.so:${CONDA_PREFIX}/lib/libiomp5.so"
++export KMP_BLOCKTIME=1
++export KMP_AFFINITY="granularity=fine,compact,1,0"
+ 
 +echo "fp32 inference"
-+python -u dlrm_s_pytorch.py --arch-sparse-feature-size=128 --arch-mlp-bot="13-512-256-128" --arch-mlp-top="1024-1024-512-256-1" --max-ind-range=40000000 --data-generation=dataset --data-set=terabyte --raw-data-file=${data_path}/day --processed-data-file=${data_path}/terabyte_processed.npz --loss-function=bce --round-targets=True --learning-rate=1.0 --mini-batch-size=2048 --print-freq=2048 --print-time --test-freq=102400 --test-mini-batch-size=16384 --test-num-workers=16 --memory-map --mlperf-logging --mlperf-auc-threshold=0.8025 --mlperf-bin-loader --mlperf-bin-shuffle --load-model=${fp32_load_path}  --inference-only $dlrm_extra_option 2>&1 | tee run_terabyte_mlperf_pt_fp32inference.log
++python -u dlrm_s_pytorch.py    --print-auc --mlperf-bin-loader --arch-sparse-feature-size=128 --arch-mlp-bot="13-512-256-128" --arch-mlp-top="1024-1024-512-256-1" --max-ind-range=40000000 --data-generation=dataset --data-set=terabyte --raw-data-file=${data_path}/day --processed-data-file=${data_path}/terabyte_processed.npz --loss-function=bce --round-targets=True --learning-rate=1.0 --mini-batch-size=2048 --print-freq=2048 --print-time --test-freq=102400 --test-mini-batch-size=16384 --test-num-workers=16 --memory-map --mlperf-logging --mlperf-auc-threshold=0.8025  --inference-only --load-model=${fp32_load_path} $dlrm_extra_option 2>&1 | tee log/use_val/fp32
++#expect fp32 auc:0.8027
++echo "save int8 weight"
++python -u dlrm_s_pytorch.py --load-model=${fp32_load_path} --print-auc --calibration-mini-batch-size=2048 --mlperf-bin-loader --arch-sparse-feature-size=128 --arch-mlp-bot="13-512-256-128" --arch-mlp-top="1024-1024-512-256-1" --max-ind-range=40000000 --data-generation=dataset --data-set=terabyte --raw-data-file=${data_path}/day --processed-data-file=${data_path}/terabyte_processed.npz --loss-function=bce --round-targets=True --learning-rate=1.0 --mini-batch-size=2048 --print-freq=2048 --print-time --test-freq=102400 --test-mini-batch-size=16384 --test-num-workers=16 --memory-map --mlperf-logging --mlperf-auc-threshold=0.8025   --inference-only --do-int8-inference  --save-int8=${int8_path} $dlrm_extra_option 2>&1 | tee log/use_val/save_int8
++#expect int8 auc:0.8013
 +echo "int8 inference"
-+python -u dlrm_s_pytorch.py --arch-sparse-feature-size=128 --arch-mlp-bot="13-512-256-128" --arch-mlp-top="1024-1024-512-256-1" --max-ind-range=40000000 --data-generation=dataset --data-set=terabyte --raw-data-file=${data_path}/day --processed-data-file=${data_path}/terabyte_processed.npz --loss-function=bce --round-targets=True --learning-rate=1.0 --mini-batch-size=2048 --print-freq=2048 --print-time --test-freq=102400 --test-mini-batch-size=16384 --test-num-workers=16 --memory-map --mlperf-logging --mlperf-auc-threshold=0.8025 --mlperf-bin-loader --mlperf-bin-shuffle --load-model=${fp32_load_path}  --inference-only --do-int8-inference  $dlrm_extra_option 2>&1 | tee run_terabyte_mlperf_pt_int8.log
++python -u dlrm_s_pytorch.py  --do-int8-inference --print-auc --mlperf-bin-loader --arch-sparse-feature-size=128 --arch-mlp-bot="13-512-256-128" --arch-mlp-top="1024-1024-512-256-1" --max-ind-range=40000000 --data-generation=dataset --data-set=terabyte --raw-data-file=${data_path}/day --processed-data-file=${data_path}/terabyte_processed.npz --loss-function=bce --round-targets=True --learning-rate=1.0 --mini-batch-size=2048 --print-freq=2048 --print-time --test-freq=102400 --test-mini-batch-size=16384 --test-num-workers=16 --memory-map --mlperf-logging --mlperf-auc-threshold=0.8025   --load-int8=${int8_path} --inference-only   $dlrm_extra_option 2>&1 | tee log/use_val/int8
++#expect int8 auc:0.8027
  echo "done"
+diff --git a/dlrm_data_pytorch.py b/dlrm_data_pytorch.py
+index 6cbe382..907a670 100644
+--- a/dlrm_data_pytorch.py
++++ b/dlrm_data_pytorch.py
+@@ -387,7 +387,7 @@ def make_criteo_data_and_loaders(args):
+             d_path = "/".join(lstr[0:-1]) + "/" + lstr[-1].split(".")[0]
+             train_file = d_path + "_train.bin"
+             test_file = d_path + "_test.bin"
+-            # val_file = d_path + "_val.bin"
++            val_file = d_path + "_val.bin"
+             counts_file = args.raw_data_file + '_fea_count.npz'
+ 
+             if any(not path.exists(p) for p in [train_file,
+@@ -431,6 +431,24 @@ def make_criteo_data_and_loaders(args):
+                 pin_memory=False,
+                 drop_last=False,
+             )
 +
++            val_data = data_loader_terabyte.CriteoBinDataset(
++                data_file=val_file,
++                counts_file=counts_file,
++                batch_size=args.calibration_mini_batch_size,
++                max_ind_range=args.max_ind_range
++            )
 +
-+
-+
-+
++            val_loader = torch.utils.data.DataLoader(
++                val_data,
++                batch_size=None,
++                batch_sampler=None,
++                shuffle=False,
++                num_workers=0,
++                collate_fn=None,
++                pin_memory=False,
++                drop_last=False,
++            )
+         else:
+             data_filename = args.raw_data_file.split("/")[-1]
+ 
+@@ -516,8 +534,7 @@ def make_criteo_data_and_loaders(args):
+             drop_last=False,  # True
+         )
+ 
+-    return train_data, train_loader, test_data, test_loader
+-
++    return train_data, train_loader, test_data, test_loader, val_data, val_loader
+ 
+ # uniform ditribution (input data)
+ class RandomDataset(Dataset):
 diff --git a/dlrm_s_pytorch.py b/dlrm_s_pytorch.py
-index 9bf762b..71f8d3a 100644
+index 9bf762b..05f986c 100644
 --- a/dlrm_s_pytorch.py
 +++ b/dlrm_s_pytorch.py
-@@ -87,6 +87,12 @@ from tricks.md_embedding_bag import PrEmbeddingBag, md_solver
+@@ -87,6 +87,11 @@ from tricks.md_embedding_bag import PrEmbeddingBag, md_solver
  
  import sklearn.metrics
  
@@ -34,11 +90,10 @@ index 9bf762b..71f8d3a 100644
 +from torch.quantization import QuantWrapper, QuantStub, DeQuantStub, \
 +    default_per_channel_qconfig, QConfig, default_qconfig
 +
-+
  # from torchviz import make_dot
  # import torch.nn.functional as Functional
  # from torch.nn.parameter import Parameter
-@@ -132,9 +138,9 @@ class DLRM_Net(nn.Module):
+@@ -132,9 +137,9 @@ class DLRM_Net(nn.Module):
                  layers.append(nn.ReLU())
  
          # approach 1: use ModuleList
@@ -50,7 +105,7 @@ index 9bf762b..71f8d3a 100644
  
      def create_emb(self, m, ln):
          emb_l = nn.ModuleList()
-@@ -230,11 +236,11 @@ class DLRM_Net(nn.Module):
+@@ -230,11 +235,11 @@ class DLRM_Net(nn.Module):
  
      def apply_mlp(self, x, layers):
          # approach 1: use ModuleList
@@ -66,7 +121,7 @@ index 9bf762b..71f8d3a 100644
  
      def apply_emb(self, lS_o, lS_i, emb_l):
          # WARNING: notice that we are processing the batch at once. We implicitly
-@@ -448,6 +454,9 @@ if __name__ == "__main__":
+@@ -448,6 +453,9 @@ if __name__ == "__main__":
      # model related parameters
      parser.add_argument("--arch-sparse-feature-size", type=int, default=2)
      parser.add_argument("--arch-embedding-size", type=str, default="4-3-2")
@@ -76,40 +131,73 @@ index 9bf762b..71f8d3a 100644
      # j will be replaced with the table number
      parser.add_argument("--arch-mlp-bot", type=str, default="4-3-2")
      parser.add_argument("--arch-mlp-top", type=str, default="4-2-1")
-@@ -509,6 +518,7 @@ if __name__ == "__main__":
+@@ -503,12 +511,16 @@ if __name__ == "__main__":
+     parser.add_argument("--print-freq", type=int, default=1)
+     parser.add_argument("--test-freq", type=int, default=-1)
+     parser.add_argument("--test-mini-batch-size", type=int, default=-1)
++    parser.add_argument("--calibration-mini-batch-size", type=int ,default=-1)
+     parser.add_argument("--test-num-workers", type=int, default=-1)
+     parser.add_argument("--print-time", action="store_true", default=False)
++    parser.add_argument("--print-auc", action="store_true", default=False)
+     parser.add_argument("--debug-mode", action="store_true", default=False)
      parser.add_argument("--enable-profiling", action="store_true", default=False)
      parser.add_argument("--plot-compute-graph", action="store_true", default=False)
      # store/load model
 +    parser.add_argument("--save-int8", type=str, default="")
++    parser.add_argument("--load-int8", type=str, default="")
      parser.add_argument("--save-model", type=str, default="")
      parser.add_argument("--load-model", type=str, default="")
      # mlperf logging (disables other output and stops early)
-@@ -555,7 +565,7 @@ if __name__ == "__main__":
+@@ -533,6 +545,9 @@ if __name__ == "__main__":
+     if (args.test_mini_batch_size < 0):
+         # if the parameter is not set, use the training batch size
+         args.test_mini_batch_size = args.mini_batch_size
++    if (args.calibration_mini_batch_size < 0):
++        # if the parameter is not set, use the training batch size
++        args.calibration_mini_batch_size = args.mini_batch_size
+     if (args.test_num_workers < 0):
+         # if the parameter is not set, use the same parameter for training
+         args.test_num_workers = args.num_workers
+@@ -553,9 +568,10 @@ if __name__ == "__main__":
+     # input data
+     if (args.data_generation == "dataset"):
  
-         train_data, train_ld, test_data, test_ld = \
+-        train_data, train_ld, test_data, test_ld = \
++        train_data, train_ld, test_data, test_ld, val_date, val_ld = \
              dp.make_criteo_data_and_loaders(args)
 -        nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
-+        nbatches = args.num_batches if args.num_batches > 0 else len(test_ld)
++        data_ld = test_ld if args.print_auc else train_ld 
++        nbatches = args.num_batches if args.num_batches > 0 else len(data_ld)
          nbatches_test = len(test_ld)
  
          ln_emb = train_data.counts
-@@ -864,6 +874,57 @@ if __name__ == "__main__":
-                 ld_gL_test, ld_gA_test * 100
+@@ -572,7 +588,8 @@ if __name__ == "__main__":
+         ln_emb = np.fromstring(args.arch_embedding_size, dtype=int, sep="-")
+         m_den = ln_bot[0]
+         train_data, train_ld = dp.make_random_data_and_loader(args, ln_emb, m_den)
+-        nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
++        data_ld = test_ld if args.print_auc else train_ld
++        nbatches = args.num_batches if args.num_batches > 0 else len(data_ld)
+ 
+     ### parse command line arguments ###
+     m_spa = args.arch_sparse_feature_size
+@@ -865,6 +882,90 @@ if __name__ == "__main__":
              )
          )
-+    
-+
-+
+ 
 +    if args.do_int8_inference and args.inference_only:
 +        print('do_int8_inference')
 +        fuse_list = []
++        print("begin fuse")
 +        for i in range(0, len(dlrm.bot_l), 2):
 +            fuse_list.append(["bot_l.%d" % (i), "bot_l.%d" % (i + 1)])
 +        dlrm = fuse_modules(dlrm, fuse_list)
++        print("fuse_once")
 +        fuse_list = []
 +        for i in range(0, len(dlrm.top_l) - 2, 2):
 +            fuse_list.append(["top_l.%d" % (i), "top_l.%d" % (i + 1)])
 +        dlrm = fuse_modules(dlrm, fuse_list)
++        print("begin insert")
 +        dlrm.bot_l.insert(0, QuantStub())
 +        dlrm.bot_l.append(DeQuantStub())
 +        dlrm.top_l.insert(0, QuantStub())
@@ -118,18 +206,50 @@ index 9bf762b..71f8d3a 100644
 +        if args.per_tensor_linear:
 +            dlrm.bot_l.qconfig = default_qconfig
 +            dlrm.top_l.qconfig = default_qconfig
++        print("prepare")
 +        dlrm = prepare(dlrm)
-+        j = 0
-+        for j, (X, lS_o, lS_i, T) in enumerate(test_ld):
-+            Z = dlrm_wrap(X, lS_o, lS_i, use_gpu, device)
-+            if j > nbatches * 0.05:
++        print("prepare done")
++        if args.load_int8 == "":
++            print("run calibration")
++            j = 0
++            # val_data is the second half of date23, use first 128k pair as calibration dataset
++            calibration_batch = 128 * 1024 / args.calibration_mini_batch_size
++            for j, (X, lS_o, lS_i, T) in enumerate(val_ld):
++                Z = dlrm_wrap(X, lS_o, lS_i, use_gpu, device)
++                if j > calibration_batch:
++                    break
++            print("convert")
++            dlrm = convert(dlrm)
++            print("convert done")
++        else:
++            # fake calibration to get qmodel
++            j = 0
++            for j, (X, lS_o, lS_i, T) in enumerate(val_ld):
++                Z = dlrm_wrap(X, lS_o, lS_i, use_gpu, device)
 +                break
-+        print("convert")
-+        dlrm = convert(dlrm)
-+        print("convert done")
++            print("convert")
++            dlrm = convert(dlrm)
++            print("convert done")
++            # load int8 weight
++            print("Loading model from {}".format(args.load_int8))
++            ld_model = torch.load(args.load_int8, map_location=torch.device('cpu'))
++            dlrm.load_state_dict(ld_model["state_dict"])
++            ld_j = ld_model["iter"]
++            ld_k = ld_model["epoch"]
++            ld_nepochs = ld_model["nepochs"]
++            ld_nbatches = ld_model["nbatches"]
++            ld_nbatches_test = ld_model["nbatches_test"]
++            ld_gA = ld_model["train_acc"]
++            ld_gL = ld_model["train_loss"]
++            ld_total_loss = ld_model["total_loss"]
++            ld_total_accu = ld_model["total_accu"]
++            ld_gA_test = ld_model["test_acc"]
++            ld_gL_test = ld_model["test_loss"]
++            args.print_freq = ld_nbatches
++            args.test_freq = 0
 +        if not (args.save_int8 == ""):
-+             print("Saving model to {}".format(args.save_int8))
-+             torch.save(
++            print("Saving model to {}".format(args.save_int8))
++            torch.save(
 +                      {
 +                          "epoch": ld_k,
 +                          "nepochs": ld_nepochs,
@@ -146,39 +266,50 @@ index 9bf762b..71f8d3a 100644
 +                      },
 +                      args.save_int8,
 +                  )
++            print("saving done")      
++            # sys.exit("saving int8 weight done")
 +
-+
- 
      print("time/loss/accuracy (if enabled):")
      with torch.autograd.profiler.profile(args.enable_profiling, use_gpu) as prof:
-@@ -875,8 +936,10 @@ if __name__ == "__main__":
+         while k < args.nepochs:
+@@ -875,8 +976,11 @@ if __name__ == "__main__":
  
              if args.mlperf_logging:
                  previous_iteration_time = None
 -
 -            for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
-+            if args.mlperf_logging:
++            if args.print_auc:
 +                scores = []
 +                targets = []
-+            for j, (X, lS_o, lS_i, T) in enumerate(test_ld):
++            data_ld = test_ld if args.print_auc else train_ld
++            for j, (X, lS_o, lS_i, T) in enumerate(data_ld):
                  if j < skip_upto_batch:
                      continue
  
-@@ -918,6 +981,9 @@ if __name__ == "__main__":
+@@ -898,7 +1002,7 @@ if __name__ == "__main__":
+                 print("input and targets")
+                 print(X.detach().cpu().numpy())
+                 print([np.diff(S_o.detach().cpu().tolist()
+-                       + list(lS_i[i].shape)).tolist() for i, S_o in enumerate(lS_o)])
++                      + list(lS_i[i].shape)).tolist() for i, S_o in enumerate(lS_o)])
+                 print([S_i.detach().cpu().numpy().tolist() for S_i in lS_i])
+                 print(T.detach().cpu().numpy())
+                 '''
+@@ -918,6 +1022,9 @@ if __name__ == "__main__":
                  L = E.detach().cpu().numpy()  # numpy array
                  S = Z.detach().cpu().numpy()  # numpy array
                  T = T.detach().cpu().numpy()  # numpy array
-+                if args.mlperf_logging:
++                if args.print_auc:
 +                    scores.append(S)
 +                    targets.append(T)
                  mbs = T.shape[0]  # = args.mini_batch_size except maybe for last
                  A = np.sum((np.round(S, 0) == T).astype(np.uint8))
  
-@@ -954,6 +1020,36 @@ if __name__ == "__main__":
+@@ -954,6 +1061,36 @@ if __name__ == "__main__":
  
                  # print time, loss and accuracy
                  if should_print or should_test:
-+                    if args.mlperf_logging:
++                    if args.print_auc:
 +                        scores = np.concatenate(scores, axis=0)
 +                        targets = np.concatenate(targets, axis=0)
 +                        metrics = {
@@ -211,33 +342,34 @@ index 9bf762b..71f8d3a 100644
                      gT = 1000.0 * total_time / total_iter if args.print_time else -1
                      total_time = 0
  
-@@ -970,6 +1066,20 @@ if __name__ == "__main__":
+@@ -970,6 +1107,21 @@ if __name__ == "__main__":
                          )
                          + "loss {:.6f}, accuracy {:3.3f} %".format(gL, gA * 100)
                      )
-+                    print(
-+                            " loss {:.6f}, recall {:.4f}, precision {:.4f},".format(
-+                                        validation_results['loss'],
-+                                        validation_results['recall'],
-+                                        validation_results['precision']
-+                                    )
-+                            + " f1 {:.4f}, ap {:.4f},".format(
-+                                        validation_results['f1'],
-+                                        validation_results['ap'],
-+                                    )
-+                            + " auc {:.4f},".format(
-+                                        validation_results['roc_auc'],
-+                                    )
-+                        )
++                    if args.print_auc:
++                        print(
++                                " loss {:.6f}, recall {:.4f}, precision {:.4f},".format(
++                                            validation_results['loss'],
++                                            validation_results['recall'],
++                                            validation_results['precision']
++                                        )
++                                + " f1 {:.4f}, ap {:.4f},".format(
++                                            validation_results['f1'],
++                                            validation_results['ap'],
++                                        )
++                                + " auc {:.4f},".format(
++                                            validation_results['roc_auc'],
++                                        )
++                            )
                      # Uncomment the line below to print out the total time with overhead
                      # print("Accumulated time so far: {}" \
                      # .format(time_wrap(use_gpu) - accum_time_begin))
-@@ -1162,7 +1272,7 @@ if __name__ == "__main__":
+@@ -1162,7 +1314,7 @@ if __name__ == "__main__":
          with open("dlrm_s_pytorch.prof", "w") as prof_f:
              prof_f.write(prof.key_averages().table(sort_by="cpu_time_total"))
              prof.export_chrome_trace("./dlrm_s_pytorch.json")
 -        # print(prof.key_averages().table(sort_by="cpu_time_total"))
-+        print(prof.key_averages().table(sort_by="cpu_time_total"))
++        print(prof.key_averages().table(sort_by="self_cpu_time_total"))
  
      # plot compute graph
      if args.plot_compute_graph:
