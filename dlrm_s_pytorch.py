@@ -80,6 +80,10 @@ import torch.nn as nn
 from torch.nn.parallel.parallel_apply import parallel_apply
 from torch.nn.parallel.replicate import replicate
 from torch.nn.parallel.scatter_gather import gather, scatter
+
+import intel_pytorch_extension as ipex
+from intel_pytorch_extension import core
+
 # quotient-remainder trick
 from tricks.qr_embedding_bag import QREmbeddingBag
 # mixed-dimension trick
@@ -132,6 +136,24 @@ class LRPolicyScheduler(_LRScheduler):
                 lr = self.base_lrs
         return lr
 
+
+class Cast(nn.Module):
+     __constants__ = ['to_dtype']
+ 
+     def __init__(self, to_dtype):
+         super(Cast, self).__init__()
+         self.to_dtype = to_dtype
+ 
+     def forward(self, input):
+         if input.is_mkldnn:
+             return input.to_dense(self.to_dtype)
+         else:
+             return input.to(self.to_dtype)
+ 
+     def extra_repr(self):
+         return 'to(%s)' % self.to_dtype
+
+ 
 ### define dlrm in PyTorch ###
 class DLRM_Net(nn.Module):
     def create_mlp(self, ln, sigmoid_layer):
@@ -142,7 +164,13 @@ class DLRM_Net(nn.Module):
             m = ln[i + 1]
 
             # construct fully connected operator
-            LL = nn.Linear(int(n), int(m), bias=True)
+            if self.use_ipex and self.bf16:
+                if i != sigmoid_layer:
+                    LL = ipex.LinearFuseRelu(int(n), int(m), bias=True)
+                else:
+                    LL = ipex.LinearFuseRelu(int(n), int(m), bias=True, fuse_relu=False)
+            else:
+                LL = nn.Linear(int(n), int(m), bias=True)
 
             # initialize the weights
             # with torch.no_grad():
@@ -161,13 +189,22 @@ class DLRM_Net(nn.Module):
             # approach 3
             # LL.weight = Parameter(torch.tensor(W),requires_grad=True)
             # LL.bias = Parameter(torch.tensor(bt),requires_grad=True)
+
+            if self.bf16 and ipex.is_available():
+                LL.to(torch.bfloat16)
+
             layers.append(LL)
 
             # construct sigmoid or relu operator
             if i == sigmoid_layer:
+                if self.bf16:
+                    layers.append(Cast(torch.float32))
                 layers.append(nn.Sigmoid())
             else:
-                layers.append(nn.ReLU())
+                if self.use_ipex and self.bf16:
+                    continue
+                else:
+                    layers.append(nn.ReLU())
 
         # approach 1: use ModuleList
         # return layers
@@ -193,19 +230,22 @@ class DLRM_Net(nn.Module):
                 EE.embs.weight.data = torch.tensor(W, requires_grad=True)
 
             else:
+                print("create emb", i)
                 EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True)
 
                 # initialize embeddings
                 # nn.init.uniform_(EE.weight, a=-np.sqrt(1 / n), b=np.sqrt(1 / n))
-                W = np.random.uniform(
-                    low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, m)
-                ).astype(np.float32)
-                # approach 1
-                EE.weight.data = torch.tensor(W, requires_grad=True)
+                # W = np.random.uniform(
+                #     low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, m)
+                # ).astype(np.float32)
+                # # approach 1
+                # EE.weight.data = torch.tensor(W, requires_grad=True)
                 # approach 2
                 # EE.weight.data.copy_(torch.tensor(W))
                 # approach 3
                 # EE.weight = Parameter(torch.tensor(W),requires_grad=True)
+                if self.bf16 and ipex.is_available():
+                    EE.to(torch.bfloat16)
 
             emb_l.append(EE)
 
@@ -230,6 +270,8 @@ class DLRM_Net(nn.Module):
         qr_threshold=200,
         md_flag=False,
         md_threshold=200,
+        bf16=False,
+        use_ipex=False,
     ):
         super(DLRM_Net, self).__init__()
 
@@ -250,6 +292,8 @@ class DLRM_Net(nn.Module):
             self.arch_interaction_itself = arch_interaction_itself
             self.sync_dense_params = sync_dense_params
             self.loss_threshold = loss_threshold
+            self.bf16 = bf16
+            self.use_ipex = use_ipex
             # create variables for QR embedding if applicable
             self.qr_flag = qr_flag
             if self.qr_flag:
@@ -299,27 +343,32 @@ class DLRM_Net(nn.Module):
         return ly
 
     def interact_features(self, x, ly):
+        #x = x.to(ly[0].dtype)
         if self.arch_interaction_op == "dot":
-            # concatenate dense and sparse features
-            (batch_size, d) = x.shape
-            T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
-            # perform a dot product
-            Z = torch.bmm(T, torch.transpose(T, 1, 2))
-            # append dense feature with the interactions (into a row vector)
-            # approach 1: all
-            # Zflat = Z.view((batch_size, -1))
-            # approach 2: unique
-            _, ni, nj = Z.shape
-            # approach 1: tril_indices
-            # offset = 0 if self.arch_interaction_itself else -1
-            # li, lj = torch.tril_indices(ni, nj, offset=offset)
-            # approach 2: custom
-            offset = 1 if self.arch_interaction_itself else 0
-            li = torch.tensor([i for i in range(ni) for j in range(i + offset)])
-            lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
-            Zflat = Z[:, li, lj]
-            # concatenate dense features and interactions
-            R = torch.cat([x] + [Zflat], dim=1)
+            if self.bf16:
+                T = [x] + ly
+                R = ipex.interaction(*T)
+            else:
+                # concatenate dense and sparse features
+                (batch_size, d) = x.shape
+                T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
+                # perform a dot product
+                Z = torch.bmm(T, torch.transpose(T, 1, 2))
+                # append dense feature with the interactions (into a row vector)
+                # approach 1: all
+                # Zflat = Z.view((batch_size, -1))
+                # approach 2: unique
+                _, ni, nj = Z.shape
+                # approach 1: tril_indices
+                # offset = 0 if self.arch_interaction_itself else -1
+                # li, lj = torch.tril_indices(ni, nj, offset=offset)
+                # approach 2: custom
+                offset = 1 if self.arch_interaction_itself else 0
+                li = torch.tensor([i for i in range(ni) for j in range(i + offset)])
+                lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
+                Zflat = Z[:, li, lj]
+                # concatenate dense features and interactions
+                R = torch.cat([x] + [Zflat], dim=1)
         elif self.arch_interaction_op == "cat":
             # concatenation features (into a row vector)
             R = torch.cat([x] + ly, dim=1)
@@ -333,6 +382,8 @@ class DLRM_Net(nn.Module):
         return R
 
     def forward(self, dense_x, lS_o, lS_i):
+        if self.bf16:
+            dense_x = dense_x.bfloat16()
         if self.ndevices <= 1:
             return self.sequential_forward(dense_x, lS_o, lS_i)
         else:
@@ -473,13 +524,18 @@ class DLRM_Net(nn.Module):
 
         return z0
 
+    def prepack_weight(self):
+        for layer in self.top_l:
+            if hasattr(layer, 'weight'):
+                layer.prepack_weight()
+        for layer in self.bot_l:
+            if hasattr(layer, 'weight'):
+                layer.prepack_weight()
 
 if __name__ == "__main__":
     # the reference implementation doesn't clear the cache currently
     # but the submissions are required to do that
-    mlperf_logger.log_event(key=mlperf_logger.constants.CACHE_CLEAR, value=True)
 
-    mlperf_logger.log_start(key=mlperf_logger.constants.INIT_START, log_all_ranks=True)
 
     ### import packages ###
     import sys
@@ -567,6 +623,10 @@ if __name__ == "__main__":
     parser.add_argument("--lr-num-warmup-steps", type=int, default=0)
     parser.add_argument("--lr-decay-start-step", type=int, default=0)
     parser.add_argument("--lr-num-decay-steps", type=int, default=0)
+    # bf16 option
+    parser.add_argument("--bf16", action='store_true', default=False)
+    # ipex option
+    parser.add_argument("--use-ipex", action="store_true", default=False)
     args = parser.parse_args()
 
     if args.mlperf_logging:
@@ -586,12 +646,17 @@ if __name__ == "__main__":
         args.test_num_workers = args.num_workers
 
     use_gpu = args.use_gpu and torch.cuda.is_available()
+    use_ipex = args.use_ipex
     if use_gpu:
         torch.cuda.manual_seed_all(args.numpy_rand_seed)
         torch.backends.cudnn.deterministic = True
         device = torch.device("cuda", 0)
         ngpus = torch.cuda.device_count()  # 1
         print("Using {} GPU(s)...".format(ngpus))
+    elif use_ipex:
+        core.enable_auto_dnnl() # may not need TODO: check if need this 
+        device = torch.device("dpcpp")
+        print("Using IPEX...")
     else:
         device = torch.device("cpu")
         print("Using CPU...")
@@ -600,11 +665,6 @@ if __name__ == "__main__":
     ln_bot = np.fromstring(args.arch_mlp_bot, dtype=int, sep="-")
     # input data
 
-    mlperf_logger.barrier()
-    mlperf_logger.log_end(key=mlperf_logger.constants.INIT_STOP)
-    mlperf_logger.barrier()
-    mlperf_logger.log_start(key=mlperf_logger.constants.RUN_START)
-    mlperf_logger.barrier()
 
     if (args.data_generation == "dataset"):
         train_data, train_ld, test_data, test_ld = \
@@ -778,6 +838,8 @@ if __name__ == "__main__":
         qr_threshold=args.qr_threshold,
         md_flag=args.md_flag,
         md_threshold=args.md_threshold,
+        use_ipex=args.use_ipex,
+        bf16=args.bf16
     )
     print('Model created!')
     # test prints
@@ -818,8 +880,8 @@ if __name__ == "__main__":
             torch.cuda.synchronize()
         return time.time()
 
-    def dlrm_wrap(X, lS_o, lS_i, use_gpu, device):
-        if use_gpu:  # .cuda()
+    def dlrm_wrap(X, lS_o, lS_i, use_gpu, use_ipex, device):
+        if use_gpu or use_ipex:  # .cuda()
             # lS_i can be either a list of tensors or a stacked tensor.
             # Handle each case below:
             lS_i = [S_i.to(device) for S_i in lS_i] if isinstance(lS_i, list) \
@@ -834,9 +896,9 @@ if __name__ == "__main__":
         else:
             return dlrm(X, lS_o, lS_i)
 
-    def loss_fn_wrap(Z, T, use_gpu, device):
+    def loss_fn_wrap(Z, T, use_gpu, use_ipex, device):
         if args.loss_function == "mse" or args.loss_function == "bce":
-            if use_gpu:
+            if use_gpu or use_ipex:
                 return loss_fn(Z, T.to(device))
             else:
                 return loss_fn(Z, T)
@@ -865,9 +927,6 @@ if __name__ == "__main__":
     total_samp = 0
     k = 0
 
-    mlperf_logger.mlperf_submission_log('dlrm')
-    mlperf_logger.log_event(key=mlperf_logger.constants.SEED, value=args.numpy_rand_seed)
-    mlperf_logger.log_event(key=mlperf_logger.constants.GLOBAL_BATCH_SIZE, value=args.mini_batch_size)
 
     # Load model is specified
     if not (args.load_model == ""):
@@ -889,28 +948,30 @@ if __name__ == "__main__":
         else:
             # when targeting inference on CPU
             ld_model = torch.load(args.load_model, map_location=torch.device('cpu'))
-        dlrm.load_state_dict(ld_model["state_dict"])
-        ld_j = ld_model["iter"]
-        ld_k = ld_model["epoch"]
-        ld_nepochs = ld_model["nepochs"]
-        ld_nbatches = ld_model["nbatches"]
-        ld_nbatches_test = ld_model["nbatches_test"]
-        ld_gA = ld_model["train_acc"]
-        ld_gL = ld_model["train_loss"]
-        ld_total_loss = ld_model["total_loss"]
-        ld_total_accu = ld_model["total_accu"]
-        ld_gA_test = ld_model["test_acc"]
-        ld_gL_test = ld_model["test_loss"]
-        if not args.inference_only:
-            optimizer.load_state_dict(ld_model["opt_state_dict"])
-            best_gA_test = ld_gA_test
-            total_loss = ld_total_loss
-            total_accu = ld_total_accu
-            skip_upto_epoch = ld_k  # epochs
-            skip_upto_batch = ld_j  # batches
-        else:
-            args.print_freq = ld_nbatches
-            args.test_freq = 0
+            dlrm.load_state_dict(ld_model["state_dict"])
+            if use_ipex:
+                dlrm = dlrm.to(device)
+            ld_j = ld_model["iter"]
+            ld_k = ld_model["epoch"]
+            ld_nepochs = ld_model["nepochs"]
+            ld_nbatches = ld_model["nbatches"]
+            ld_nbatches_test = ld_model["nbatches_test"]
+            ld_gA = ld_model["train_acc"]
+            ld_gL = ld_model["train_loss"]
+            ld_total_loss = ld_model["total_loss"]
+            ld_total_accu = ld_model["total_accu"]
+            ld_gA_test = ld_model["test_acc"]
+            ld_gL_test = ld_model["test_loss"]
+            if not args.inference_only:
+                optimizer.load_state_dict(ld_model["opt_state_dict"])
+                best_gA_test = ld_gA_test
+                total_loss = ld_total_loss
+                total_accu = ld_total_accu
+                skip_upto_epoch = ld_k  # epochs
+                skip_upto_batch = ld_j  # batches
+            else:
+                args.print_freq = ld_nbatches
+                args.test_freq = 0
 
         print(
             "Saved at: epoch = {:d}/{:d}, batch = {:d}/{:d}, ntbatch = {:d}".format(
@@ -928,28 +989,17 @@ if __name__ == "__main__":
             )
         )
 
+    if use_ipex:
+        dlrm.prepack_weight()
+
     print("time/loss/accuracy (if enabled):")
 
     # LR is logged twice for now because of a compliance checker bug
-    mlperf_logger.log_event(key=mlperf_logger.constants.OPT_BASE_LR, value=args.learning_rate)
-    mlperf_logger.log_event(key=mlperf_logger.constants.OPT_LR_WARMUP_STEPS,
-                            value=args.lr_num_warmup_steps)
 
     # use logging keys from the official HP table and not from the logging library
-    mlperf_logger.log_event(key='sgd_opt_base_learning_rate', value=args.learning_rate)
-    mlperf_logger.log_event(key='lr_decay_start_steps', value=args.lr_decay_start_step)
-    mlperf_logger.log_event(key='sgd_opt_learning_rate_decay_steps', value=args.lr_num_decay_steps)
-    mlperf_logger.log_event(key='sgd_opt_learning_rate_decay_poly_power', value=2)
 
     with torch.autograd.profiler.profile(args.enable_profiling, use_gpu) as prof:
         while k < args.nepochs:
-            mlperf_logger.barrier()
-            mlperf_logger.log_start(key=mlperf_logger.constants.BLOCK_START,
-                                    metadata={mlperf_logger.constants.FIRST_EPOCH_NUM: (k + 1),
-                                              mlperf_logger.constants.EPOCH_COUNT: 1})
-            mlperf_logger.barrier()
-            mlperf_logger.log_start(key=mlperf_logger.constants.EPOCH_START,
-                                    metadata={mlperf_logger.constants.EPOCH_NUM: k + 1})
 
             if k < skip_upto_epoch:
                 continue
@@ -990,10 +1040,10 @@ if __name__ == "__main__":
                 '''
 
                 # forward pass
-                Z = dlrm_wrap(X, lS_o, lS_i, use_gpu, device)
+                Z = dlrm_wrap(X, lS_o, lS_i, use_gpu, use_ipex, device)
 
                 # loss
-                E = loss_fn_wrap(Z, T, use_gpu, device)
+                E = loss_fn_wrap(Z, T, use_gpu, use_ipex, device)
                 '''
                 # debug prints
                 print("output and loss")
@@ -1066,9 +1116,6 @@ if __name__ == "__main__":
                 # testing
                 if should_test and not args.inference_only:
                     epoch_num_float = (j + 1) / len(train_ld) + k + 1
-                    mlperf_logger.barrier()
-                    mlperf_logger.log_start(key=mlperf_logger.constants.EVAL_START,
-                                            metadata={mlperf_logger.constants.EPOCH_NUM: epoch_num_float})
 
                     # don't measure training iter time in a test iteration
                     if args.mlperf_logging:
@@ -1092,7 +1139,7 @@ if __name__ == "__main__":
 
                         # forward pass
                         Z_test = dlrm_wrap(
-                            X_test, lS_o_test, lS_i_test, use_gpu, device
+                            X_test, lS_o_test, lS_i_test, use_gpu, use_ipex, device
                         )
                         if args.mlperf_logging:
                             S_test = Z_test.detach().cpu().numpy()  # numpy array
@@ -1101,7 +1148,7 @@ if __name__ == "__main__":
                             targets.append(T_test)
                         else:
                             # loss
-                            E_test = loss_fn_wrap(Z_test, T_test, use_gpu, device)
+                            E_test = loss_fn_wrap(Z_test, T_test, use_gpu, use_ipex, device)
 
                             # compute loss and accuracy
                             L_test = E_test.detach().cpu().numpy()  # numpy array
@@ -1119,51 +1166,54 @@ if __name__ == "__main__":
                         scores = np.concatenate(scores, axis=0)
                         targets = np.concatenate(targets, axis=0)
 
-                        metrics = {
-                            'loss' : sklearn.metrics.log_loss,
-                            'recall' : lambda y_true, y_score:
-                            sklearn.metrics.recall_score(
-                                y_true=y_true,
-                                y_pred=np.round(y_score)
-                            ),
-                            'precision' : lambda y_true, y_score:
-                            sklearn.metrics.precision_score(
-                                y_true=y_true,
-                                y_pred=np.round(y_score)
-                            ),
-                            'f1' : lambda y_true, y_score:
-                            sklearn.metrics.f1_score(
-                                y_true=y_true,
-                                y_pred=np.round(y_score)
-                            ),
-                            'ap' : sklearn.metrics.average_precision_score,
-                            'roc_auc' : sklearn.metrics.roc_auc_score,
-                            'accuracy' : lambda y_true, y_score:
-                            sklearn.metrics.accuracy_score(
-                                y_true=y_true,
-                                y_pred=np.round(y_score)
-                            ),
-                            # 'pre_curve' : sklearn.metrics.precision_recall_curve,
-                            # 'roc_curve' :  sklearn.metrics.roc_curve,
-                        }
-
-                        # print("Compute time for validation metric : ", end="")
-                        # first_it = True
                         validation_results = {}
-                        for metric_name, metric_function in metrics.items():
-                            # if first_it:
-                            #     first_it = False
-                            # else:
-                            #     print(", ", end="")
-                            # metric_compute_start = time_wrap(False)
-                            validation_results[metric_name] = metric_function(
-                                targets,
-                                scores
-                            )
-                            # metric_compute_end = time_wrap(False)
-                            # met_time = metric_compute_end - metric_compute_start
-                            # print("{} {:.4f}".format(metric_name, 1000 * (met_time)),
-                            #      end="")
+                        if args.use_ipex:
+                            validation_results['roc_auc'], validation_results['loss'], validation_results['accuracy'] = \
+                                core.roc_auc_score(torch.from_numpy(targets).reshape(-1), torch.from_numpy(scores).reshape(-1))
+                        else:
+                            metrics = {
+                                'loss' : sklearn.metrics.log_loss,
+                                'recall' : lambda y_true, y_score:
+                                sklearn.metrics.recall_score(
+                                    y_true=y_true,
+                                    y_pred=np.round(y_score)
+                                ),
+                                'precision' : lambda y_true, y_score:
+                                sklearn.metrics.precision_score(
+                                    y_true=y_true,
+                                    y_pred=np.round(y_score)
+                                ),
+                                'f1' : lambda y_true, y_score:
+                                sklearn.metrics.f1_score(
+                                    y_true=y_true,
+                                    y_pred=np.round(y_score)
+                                ),
+                                'ap' : sklearn.metrics.average_precision_score,
+                                'roc_auc' : sklearn.metrics.roc_auc_score,
+                                'accuracy' : lambda y_true, y_score:
+                                sklearn.metrics.accuracy_score(
+                                    y_true=y_true,
+                                    y_pred=np.round(y_score)
+                                ),
+                            }
+
+                            # print("Compute time for validation metric : ", end="")
+                            # first_it = True
+                            for metric_name, metric_function in metrics.items():
+                                # if first_it:
+                                #     first_it = False
+                                # else:
+                                #     print(", ", end="")
+                                # metric_compute_start = time_wrap(False)
+                                validation_results[metric_name] = metric_function(
+                                    targets,
+                                    scores
+                                )
+                                # metric_compute_end = time_wrap(False)
+                                # met_time = metric_compute_end - metric_compute_start
+                                # print("{} {:.4f}".format(metric_name, 1000 * (met_time)),
+                                #      end="")
+
                         # print(" ms")
                         gA_test = validation_results['accuracy']
                         gL_test = validation_results['loss']
@@ -1200,19 +1250,10 @@ if __name__ == "__main__":
                         if is_best:
                             best_auc_test = validation_results['roc_auc']
 
-                        mlperf_logger.log_event(key=mlperf_logger.constants.EVAL_ACCURACY,
-                                                value=float(validation_results['roc_auc']),
-                                                metadata={mlperf_logger.constants.EPOCH_NUM: epoch_num_float})
                         print(
                             "Testing at - {}/{} of epoch {},".format(j + 1, nbatches, k)
-                            + " loss {:.6f}, recall {:.4f}, precision {:.4f},".format(
-                                validation_results['loss'],
-                                validation_results['recall'],
-                                validation_results['precision']
-                            )
-                            + " f1 {:.4f}, ap {:.4f},".format(
-                                validation_results['f1'],
-                                validation_results['ap'],
+                            + " loss {:.6f},".format(
+                                validation_results['loss']
                             )
                             + " auc {:.4f}, best auc {:.4f},".format(
                                 validation_results['roc_auc'],
@@ -1230,9 +1271,6 @@ if __name__ == "__main__":
                                 gL_test, gA_test * 100, best_gA_test * 100
                             )
                         )
-                    mlperf_logger.barrier()
-                    mlperf_logger.log_end(key=mlperf_logger.constants.EVAL_STOP,
-                                          metadata={mlperf_logger.constants.EPOCH_NUM: epoch_num_float})
 
                     # Uncomment the line below to print out the total time with overhead
                     # print("Total test time for this group: {}" \
@@ -1252,24 +1290,10 @@ if __name__ == "__main__":
                         print("MLPerf testing auc threshold "
                               + str(args.mlperf_auc_threshold)
                               + " reached, stop training")
-                        mlperf_logger.barrier()
-                        mlperf_logger.log_end(key=mlperf_logger.constants.RUN_STOP,
-                                              metadata={
-                                                  mlperf_logger.constants.STATUS: mlperf_logger.constants.SUCCESS})
                         break
 
-            mlperf_logger.barrier()
-            mlperf_logger.log_end(key=mlperf_logger.constants.EPOCH_STOP,
-                                  metadata={mlperf_logger.constants.EPOCH_NUM: k + 1})
-            mlperf_logger.barrier()
-            mlperf_logger.log_end(key=mlperf_logger.constants.BLOCK_STOP,
-                                  metadata={mlperf_logger.constants.FIRST_EPOCH_NUM: k + 1})
             k += 1  # nepochs
 
-    if args.mlperf_logging and best_auc_test <= args.mlperf_auc_threshold:
-        mlperf_logger.barrier()
-        mlperf_logger.log_end(key=mlperf_logger.constants.RUN_STOP,
-                              metadata={mlperf_logger.constants.STATUS: mlperf_logger.constants.ABORTED})
 
     # profiling
     if args.enable_profiling:

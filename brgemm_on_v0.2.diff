@@ -1,0 +1,172 @@
+diff --git a/intel_pytorch_extension_py/ops/linear_fuse_relu.py b/intel_pytorch_extension_py/ops/linear_fuse_relu.py
+index d15e1b6..d417ef5 100644
+--- a/intel_pytorch_extension_py/ops/linear_fuse_relu.py
++++ b/intel_pytorch_extension_py/ops/linear_fuse_relu.py
+@@ -16,7 +16,6 @@ class LinearFuseReluFC(Function):
+     @staticmethod
+     def backward(ctx, grad_output):
+         input, weight, bias, output = ctx.saved_tensors
+-        grad_output = grad_output.contiguous()
+         if bias == None:
+             output_mask = (input.requires_grad, weight.requires_grad, 0)
+         else:
+@@ -25,16 +24,35 @@ class LinearFuseReluFC(Function):
+         grad_input, grad_weight, grad_bias = core.linear_backward(input, grad_output, weight, output_mask)
+         return (grad_input, grad_weight, grad_bias)
+ 
++class LinearFC(Function):
++    @staticmethod
++    def forward(ctx, input, weight, bias):
++        output = core.linear(input, weight, bias)
++        ctx.save_for_backward(input, weight, bias, output)
++        return output
++
++    @staticmethod
++    def backward(ctx, grad_output):
++        input, weight, bias, output = ctx.saved_tensors
++        # grad_output = grad_output.contiguous()
++        if bias == None:
++            output_mask = (input.requires_grad, weight.requires_grad, 0)
++        else:
++            output_mask = (input.requires_grad, weight.requires_grad, bias.requires_grad)
++        grad_input, grad_weight, grad_bias = core.linear_backward(input, grad_output, weight, output_mask)
++        return (grad_input, grad_weight, grad_bias)
++
+ class LinearFuseRelu(nn.Module):
+     r"""DNNL Linear module for using relu fused DNNL kernel"""
+ 
+     __constants__ = ['bias']
+ 
+-    def __init__(self, in_features, out_features, bias=True):
++    def __init__(self, in_features, out_features, bias=True, fuse_relu=True):
+         super(LinearFuseRelu, self).__init__()
+         self.in_features = in_features
+         self.out_features = out_features
+         self.weight = Parameter(torch.Tensor(out_features, in_features))
++        self.fuse_relu = fuse_relu
+ 
+         if bias:
+             self.bias = Parameter(torch.Tensor(out_features))
+@@ -47,9 +65,15 @@ class LinearFuseRelu(nn.Module):
+         if self.bias is not None:
+             bound = 1 / math.sqrt(self.in_features)
+             init.uniform_(self.bias, -bound, bound)
++    
++    def prepack_weight(self):
++        prepacked_weight = Parameter(core.linear_prepack_weight(self.weight))
++        self.weight = prepacked_weight
+ 
+     def forward(self, input):
+-        # print(self.weight.shape)
+-        output = LinearFuseReluFC.apply(input, self.weight, self.bias)
++        if self.fuse_relu:
++            output = LinearFuseReluFC.apply(input, self.weight, self.bias)
++        else:
++            output = LinearFC.apply(input, self.weight, self.bias)
+         return output
+ 
+diff --git a/third_party/mkl-dnn b/third_party/mkl-dnn
+index 07579e6..22e6712 160000
+--- a/third_party/mkl-dnn
++++ b/third_party/mkl-dnn
+@@ -1 +1 @@
+-Subproject commit 07579e6c0c6839a390a6f3040e05a2b2c71e628a
++Subproject commit 22e6712367439d157b73adcf9f7a2e8fcf1cc8bb
+diff --git a/torch_ipex/csrc/cpu/DevOPs.cpp b/torch_ipex/csrc/cpu/DevOPs.cpp
+index ebe231f..e720223 100644
+--- a/torch_ipex/csrc/cpu/DevOPs.cpp
++++ b/torch_ipex/csrc/cpu/DevOPs.cpp
+@@ -557,6 +557,18 @@ at::Tensor AtenIpexCPUDev::dil_linear(
+   return dbl::comm::gen_aten_tensor_by(std::move(y));
+ }
+ 
++at::Tensor AtenIpexCPUDev::dil_linear_prepack_weight(const at::Tensor& weight){
++  auto dil_weight = dbl::comm::try_gen_dil_tensor(weight);
++  auto packed_desc = dil::inner_product_forward::expected_weights_desc(
++    weight.sizes().vec(),
++    {},
++    dil_weight.get_data_type());
++  dil::tensor packed_weight {packed_desc};
++  packed_weight.feed_from(dil_weight);
++  auto ret = dbl::comm::gen_aten_tensor_by(std::move(packed_weight));
++  return ret;
++}
++
+ at::Tensor AtenIpexCPUDev::dil_linear_fuse_relu(
+     const at::Tensor& self,
+     const at::Tensor& weight,
+diff --git a/torch_ipex/csrc/cpu/DevOPs.h b/torch_ipex/csrc/cpu/DevOPs.h
+index 7c76873..d373cef 100644
+--- a/torch_ipex/csrc/cpu/DevOPs.h
++++ b/torch_ipex/csrc/cpu/DevOPs.h
+@@ -39,6 +39,7 @@ class AtenIpexCPUDev {
+   static at::Tensor& dil_addbmm_(at::Tensor& self, const at::Tensor& batch1, const at::Tensor& batch2, at::Scalar beta, at::Scalar alpha);
+   static at::Tensor& dil_addbmm_out(at::Tensor& result, const at::Tensor &self, const at::Tensor &batch1, const at::Tensor &batch2, at::Scalar beta, at::Scalar alpha);
+   static at::Tensor dil_linear(const at::Tensor& self, const at::Tensor& weight, const c10::optional<at::Tensor>& bias);
++  static at::Tensor dil_linear_prepack_weight(const at::Tensor& weight);
+   static at::Tensor dil_linear_fuse_relu(const at::Tensor& self, const at::Tensor& weight, const c10::optional<at::Tensor>& bias);
+   static std::tuple<at::Tensor, at::Tensor, at::Tensor> dil_linear_backward(const at::Tensor& input, const at::Tensor& grad_output, const at::Tensor& weight, std::array<bool,3> output_mask);
+   static at::Tensor dil_dropout(const at::Tensor& self, double ratio, bool train);
+diff --git a/torch_ipex/csrc/cpu/ExtendOPs.cpp b/torch_ipex/csrc/cpu/ExtendOPs.cpp
+index bb11a86..71c6a32 100644
+--- a/torch_ipex/csrc/cpu/ExtendOPs.cpp
++++ b/torch_ipex/csrc/cpu/ExtendOPs.cpp
+@@ -453,6 +453,10 @@ at::Tensor AtenIpexTypeExt::linear(const at::Tensor& input, const at::Tensor& we
+     return cpu::AtenIpexCPUDev::dil_linear(input, weight, bias);
+ }
+ 
++at::Tensor AtenIpexTypeExt::linear_prepack_weight(const at::Tensor& weight) {
++    return cpu::AtenIpexCPUDev::dil_linear_prepack_weight(weight);
++}
++
+ at::Tensor AtenIpexTypeExt::linear_fuse_relu(const at::Tensor& input, const at::Tensor& weight, const c10::optional<at::Tensor>& bias) {
+     RECORD_FUNCTION("linear_fuse_relu", std::vector<c10::IValue>({input, weight, bias}), torch::autograd::Node::peek_at_next_sequence_nr());
+     return cpu::AtenIpexCPUDev::dil_linear_fuse_relu(input, weight, bias);
+diff --git a/torch_ipex/csrc/cpu/ExtendOPs.h b/torch_ipex/csrc/cpu/ExtendOPs.h
+index 9305e45..55debd6 100644
+--- a/torch_ipex/csrc/cpu/ExtendOPs.h
++++ b/torch_ipex/csrc/cpu/ExtendOPs.h
+@@ -24,6 +24,7 @@ class AtenIpexTypeExt {
+       const c10::optional<at::Tensor>& per_sample_weights);
+ 
+   static at::Tensor linear(const at::Tensor& input, const at::Tensor& weight, const c10::optional<at::Tensor>& bias);
++  static at::Tensor linear_prepack_weight(const at::Tensor& weight);
+   static at::Tensor linear_fuse_relu(const at::Tensor& input, const at::Tensor& weight, const c10::optional<at::Tensor>& bias);
+   static std::tuple<at::Tensor, at::Tensor, at::Tensor> linear_backward(const at::Tensor& input, const at::Tensor& grad_output, const at::Tensor& weight, std::array<bool,3> output_mask);
+   static at::Tensor relu_use_dst_for_bwd(const at::Tensor& grad_output, const at::Tensor& output);
+diff --git a/torch_ipex/csrc/cpu/dil/dil/operators/inner_product.hpp b/torch_ipex/csrc/cpu/dil/dil/operators/inner_product.hpp
+index ad129ca..45af2bb 100644
+--- a/torch_ipex/csrc/cpu/dil/dil/operators/inner_product.hpp
++++ b/torch_ipex/csrc/cpu/dil/dil/operators/inner_product.hpp
+@@ -51,6 +51,7 @@ struct inner_product_forward : public dnnl::inner_product_forward {
+     x_dims[0] = src_dims.empty() ? 1 : src_dims[0];
+     auto y_dims = {x_dims[0], weights_dims[0]};
+     auto ndims = weights_dims.size();
++    x_dtype = dtype;
+     auto y_dtype = (dtype != data_type::s8) ? dtype : data_type::s32;
+ 
+     DIL_ENFORCE(x_dims.size() == weights_dims.size(),
+@@ -247,7 +248,7 @@ struct inner_product_backward_data : public dnnl::inner_product_backward_data {
+     }
+ 
+     auto diff_dst_desc = diff_dst.get_desc().to_format_any();
+-    auto weights_desc = weights_.get_desc();
++    auto weights_desc = weights_.get_desc().to_format_any();
+     auto diff_src_desc =
+         tensor::desc(diff_src_dims, diff_dst.get_data_type(), tag::any);
+ 
+diff --git a/torch_ipex/csrc/init_python_bindings.cpp b/torch_ipex/csrc/init_python_bindings.cpp
+index 6ff39b6..df88242 100644
+--- a/torch_ipex/csrc/init_python_bindings.cpp
++++ b/torch_ipex/csrc/init_python_bindings.cpp
+@@ -92,6 +92,10 @@ void InitIpexModuleBindings(py::module m) {
+         [](const at::Tensor& input, const at::Tensor& weight, const c10::optional<at::Tensor>& bias) {
+           return AtenIpexTypeExt::linear(input, weight, bias);
+         });
++  m.def("linear_prepack_weight",
++        [](const at::Tensor& weight) {
++          return AtenIpexTypeExt::linear_prepack_weight(weight);
++        });
+   m.def("linear_fuse_relu",
+         [](const at::Tensor& input, const at::Tensor& weight, const c10::optional<at::Tensor>& bias) {
+           return AtenIpexTypeExt::linear_fuse_relu(input, weight, bias);
