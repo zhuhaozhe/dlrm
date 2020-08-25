@@ -1,5 +1,5 @@
 diff --git a/intel_pytorch_extension_py/ops/linear_fuse_relu.py b/intel_pytorch_extension_py/ops/linear_fuse_relu.py
-index d15e1b6..d417ef5 100644
+index d15e1b6..ceb36c0 100644
 --- a/intel_pytorch_extension_py/ops/linear_fuse_relu.py
 +++ b/intel_pytorch_extension_py/ops/linear_fuse_relu.py
 @@ -16,7 +16,6 @@ class LinearFuseReluFC(Function):
@@ -47,7 +47,7 @@ index d15e1b6..d417ef5 100644
  
          if bias:
              self.bias = Parameter(torch.Tensor(out_features))
-@@ -47,9 +65,15 @@ class LinearFuseRelu(nn.Module):
+@@ -47,9 +65,21 @@ class LinearFuseRelu(nn.Module):
          if self.bias is not None:
              bound = 1 / math.sqrt(self.in_features)
              init.uniform_(self.bias, -bound, bound)
@@ -60,18 +60,24 @@ index d15e1b6..d417ef5 100644
 -        # print(self.weight.shape)
 -        output = LinearFuseReluFC.apply(input, self.weight, self.bias)
 +        if self.fuse_relu:
-+            output = LinearFuseReluFC.apply(input, self.weight, self.bias)
++            if torch._C.is_grad_enabled()
++                output = LinearFuseReluFC.apply(input, self.weight, self.bias)
++            else:
++                output = core.linear_fuse_relu(input, self.weight, self.bias)
 +        else:
-+            output = LinearFC.apply(input, self.weight, self.bias)
++            if torch._C.is_grad_enabled()
++                output = LinearFC.apply(input, self.weight, self.bias)
++            else:
++                output =  core.linear(input, self.weight, self.bias)
          return output
  
 diff --git a/third_party/mkl-dnn b/third_party/mkl-dnn
-index 07579e6..22e6712 160000
+index 07579e6..3bbcb48 160000
 --- a/third_party/mkl-dnn
 +++ b/third_party/mkl-dnn
 @@ -1 +1 @@
 -Subproject commit 07579e6c0c6839a390a6f3040e05a2b2c71e628a
-+Subproject commit 22e6712367439d157b73adcf9f7a2e8fcf1cc8bb
++Subproject commit 3bbcb4842965e367df0a627872aa68463f42a8a5
 diff --git a/torch_ipex/csrc/cpu/DevOPs.cpp b/torch_ipex/csrc/cpu/DevOPs.cpp
 index ebe231f..e720223 100644
 --- a/torch_ipex/csrc/cpu/DevOPs.cpp
